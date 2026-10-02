@@ -7,6 +7,7 @@ Correlates ATT&CK test scenarios with Wazuh alerts to measure detection coverage
 import argparse
 import json
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,9 +24,17 @@ try:
 except ImportError:
     HAS_WINRM = False
 
+try:
+    import ai_triage
+    HAS_AI = True
+except ImportError:
+    HAS_AI = False
+
 DB_PATH = Path(__file__).parent / "purpleops.db"
 SCENARIOS_PATH = Path(__file__).parent / "scenarios.json"
+BASELINE_PATH = Path(__file__).parent / "baseline.json"
 ALERTS_PATH = Path("/var/ossec/logs/alerts/alerts.json")
+ARCHIVES_PATH = Path("/var/ossec/logs/archives/archives.json")
 AGENT_NAME = "purpleops-windows"
 AGENT_ID = "001"
 
@@ -109,6 +118,43 @@ def correlate(technique_id, start_time, window_seconds=90):
 
     matches.sort(key=lambda x: x[0])
     return matches[0]
+
+
+def fetch_raw_events(agent_name, start_time, window_seconds=90, max_events=5):
+    """Scan the raw archive log (requires logall/logall_json enabled on the Manager) for any
+    events from this agent in the attack's time window, regardless of whether they triggered
+    an alert. This is what distinguishes a telemetry gap (nothing here at all) from a rule gap
+    (something here, but no rule matched it)."""
+    if not ARCHIVES_PATH.exists():
+        return []
+
+    events = []
+    with open(ARCHIVES_PATH, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            agent = ev.get("agent", {})
+            if agent.get("name") != agent_name:
+                continue
+
+            try:
+                ev_time = parse_alert_time(ev["timestamp"])
+            except Exception:
+                continue
+
+            delta = (ev_time - start_time).total_seconds()
+            if -10 <= delta <= window_seconds:
+                events.append(ev)
+                if len(events) >= max_events:
+                    break
+
+    return events
 
 
 def record_result(scenario, result):
@@ -246,6 +292,133 @@ def cmd_run_all(args):
     total = len(results_summary)
     print(f"\nRun complete: {detected}/{total} detected ({detected/total*100:.0f}%)" if total else "\nNo scenarios ran.")
     print("Run 'python3 purpleops.py coverage' for the deduplicated report.\n")
+
+
+def cmd_monitor(args):
+    """Detection canary: re-run every scenario via WinRM and diff the result against the
+    last saved baseline. Meant to run on a cron schedule so a detection that silently breaks
+    (a changed rule, a reconfigured agent, a rebuilt VM) gets caught automatically instead of
+    discovered by accident. Exits 1 if any technique regressed from DETECTED to something worse,
+    so cron's mail-on-nonzero-exit (or any wrapper script) can alert on it."""
+    if not HAS_WINRM:
+        print("The 'pywinrm' package is not installed. Run: pip install pywinrm --break-system-packages")
+        sys.exit(2)
+
+    scenarios = load_scenarios()
+    check_agent_active()
+
+    baseline = {}
+    if BASELINE_PATH.exists():
+        with open(BASELINE_PATH) as f:
+            baseline = json.load(f)
+
+    run_start = datetime.now(timezone.utc)
+    print(f"[{run_start.isoformat()}] PurpleOps monitor run starting ({len(scenarios)} scenarios)")
+
+    current = {}
+    for scenario in scenarios:
+        start_time = datetime.now(timezone.utc)
+        try:
+            code, out, err = winrm_client.execute_remote(scenario["test_command"], timeout=args.timeout)
+        except Exception as e:
+            print(f"  [{scenario['id']}] ERROR: could not execute on Windows: {e}")
+            current[scenario["id"]] = "ERROR"
+            continue
+
+        time.sleep(args.wait)
+        result = correlate(scenario["id"], start_time, window_seconds=args.window)
+        status, level, desc, delta = record_result(scenario, result)
+        current[scenario["id"]] = status
+
+    detected = sum(1 for s in current.values() if s == "DETECTED")
+    total = len(current)
+    rate = (detected / total * 100) if total else 0
+    print(f"Current detection rate: {detected}/{total} ({rate:.0f}%)")
+
+    regressions = []
+    improvements = []
+    for tid, status in current.items():
+        prev = baseline.get(tid)
+        if prev == "DETECTED" and status != "DETECTED":
+            regressions.append((tid, prev, status))
+        elif prev is not None and prev != "DETECTED" and status == "DETECTED":
+            improvements.append((tid, prev, status))
+
+    with open(BASELINE_PATH, "w") as f:
+        json.dump(current, f, indent=2)
+
+    if improvements:
+        print("\nImprovements since last baseline:")
+        for tid, prev, now in improvements:
+            print(f"  {tid}: was {prev}, now {now}")
+
+    if regressions:
+        print("\n!!! DETECTION REGRESSION DETECTED !!!")
+        for tid, prev, now in regressions:
+            print(f"  {tid}: was {prev}, now {now}")
+        print(f"\nBaseline updated at {BASELINE_PATH}. Investigate the regressed technique(s) above.")
+        sys.exit(1)
+
+    print("\nNo regressions. Baseline updated.")
+    sys.exit(0)
+
+
+def cmd_triage(args):
+    """AI-assisted gap triage: re-run one scenario via WinRM, and if it misses, pull the raw
+    telemetry from that time window and ask the configured LLM to diagnose whether it's a
+    telemetry gap (nothing logged) or a rule gap (logged but unmatched) -- and draft a
+    candidate Wazuh rule if it's the latter. This automates the same root-cause process used
+    to find the original T1083/T1518.001/T1046 telemetry gaps by hand."""
+    if not HAS_WINRM:
+        print("The 'pywinrm' package is not installed. Run: pip install pywinrm --break-system-packages")
+        return
+    if not HAS_AI:
+        print("The 'ai_triage' module failed to import. Check that its dependencies "
+              "(google-generativeai or anthropic) are installed.")
+        return
+
+    scenarios = load_scenarios()
+    scenario = find_scenario(args.id, scenarios)
+    if not scenario:
+        print(f"Unknown technique ID: {args.id}. Use 'list' to see available scenarios.")
+        return
+
+    check_agent_active()
+
+    print(f"\n=== Triaging {scenario['id']} - {scenario['name']} ({scenario['tactic']}) ===")
+    start_time = datetime.now(timezone.utc)
+    try:
+        code, out, err = winrm_client.execute_remote(scenario["test_command"], timeout=args.timeout)
+    except Exception as e:
+        print(f"ERROR: could not execute on Windows: {e}")
+        return
+
+    time.sleep(args.wait)
+    result = correlate(scenario["id"], start_time, window_seconds=args.window)
+    status, level, desc, delta = record_result(scenario, result)
+
+    if status == "DETECTED":
+        print(f"DETECTED - level {level} - \"{desc}\" (+{delta:.1f}s) - no triage needed.")
+        return
+
+    print("MISSED - gathering raw telemetry and asking the AI to diagnose...\n")
+    raw_events = fetch_raw_events(AGENT_NAME, start_time, window_seconds=args.window)
+    print(f"(found {len(raw_events)} raw archive event(s) in the correlation window)\n")
+
+    try:
+        analysis = ai_triage.triage_gap(scenario, raw_events)
+    except Exception as e:
+        print(f"AI triage failed: {e}")
+        return
+
+    print(analysis)
+
+    out_dir = Path(__file__).parent / "triage_reports"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / f"{scenario['id']}.md"
+    with open(out_path, "w") as f:
+        f.write(f"# Triage: {scenario['id']} - {scenario['name']}\n\n{analysis}\n")
+    print(f"\nSaved to {out_path}")
 
 
 def cmd_record(args):
@@ -440,6 +613,19 @@ def main():
     p_run_all.add_argument("--window", type=int, default=90, help="Correlation window in seconds")
     p_run_all.add_argument("--timeout", type=int, default=30, help="WinRM command timeout in seconds")
     p_run_all.set_defaults(func=cmd_run_all)
+
+    p_monitor = sub.add_parser("monitor", help="Detection canary: re-run all scenarios, diff vs last baseline, exit 1 on regression")
+    p_monitor.add_argument("--wait", type=int, default=15, help="Seconds to wait before checking alerts")
+    p_monitor.add_argument("--window", type=int, default=90, help="Correlation window in seconds")
+    p_monitor.add_argument("--timeout", type=int, default=30, help="WinRM command timeout in seconds")
+    p_monitor.set_defaults(func=cmd_monitor)
+
+    p_triage = sub.add_parser("triage", help="AI-assisted gap triage: re-run one scenario and have the AI diagnose a MISS")
+    p_triage.add_argument("id", help="Technique ID, e.g. T1059.001")
+    p_triage.add_argument("--wait", type=int, default=15, help="Seconds to wait before checking alerts")
+    p_triage.add_argument("--window", type=int, default=90, help="Correlation window in seconds")
+    p_triage.add_argument("--timeout", type=int, default=30, help="WinRM command timeout in seconds")
+    p_triage.set_defaults(func=cmd_triage)
 
     p_rec = sub.add_parser("record", help="Manually record a result (backfill)")
     p_rec.add_argument("id", help="Technique ID")
