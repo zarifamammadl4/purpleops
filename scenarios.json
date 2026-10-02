@@ -1,0 +1,62 @@
+[
+  {
+    "id": "T1059.001",
+    "name": "PowerShell Execution",
+    "tactic": "Execution",
+    "test_command": "Write-Host 'PurpleOps Test'; Get-Date"
+  },
+  {
+    "id": "T1087",
+    "name": "Account Discovery",
+    "tactic": "Discovery",
+    "test_command": "net user; whoami /all"
+  },
+  {
+    "id": "T1057",
+    "name": "Process Discovery",
+    "tactic": "Discovery",
+    "test_command": "tasklist"
+  },
+  {
+    "id": "T1082",
+    "name": "System Information Discovery",
+    "tactic": "Discovery",
+    "test_command": "systeminfo"
+  },
+  {
+    "id": "T1016",
+    "name": "System Network Configuration Discovery",
+    "tactic": "Discovery",
+    "test_command": "ipconfig /all"
+  },
+  {
+    "id": "T1053.005",
+    "name": "Scheduled Task Creation",
+    "tactic": "Persistence",
+    "test_command": "schtasks /create /tn PurpleOpsTest /tr \"cmd.exe /c echo test\" /sc once /st 23:59 /f ; schtasks /delete /tn PurpleOpsTest /f"
+  },
+  {
+    "id": "T1083",
+    "name": "File and Directory Discovery",
+    "tactic": "Discovery",
+    "test_command": "Get-ChildItem C:\\Windows\\System32 -Filter *.exe | Select-Object -First 10"
+  },
+  {
+    "id": "T1046",
+    "name": "Network Service Scanning",
+    "tactic": "Discovery",
+    "test_command": "Test-NetConnection -ComputerName 192.168.56.102 -Port 22"
+  },
+  {
+    "id": "T1518.001",
+    "name": "Security Software Discovery",
+    "tactic": "Discovery",
+    "test_command": "Get-Service | Where-Object {$_.DisplayName -like '*Defender*'}"
+  },
+  {
+    "id": "T1069",
+    "name": "Permission Groups Discovery",
+    "tactic": "Discovery",
+    "test_command": "net localgroup administrators"
+  }
+]

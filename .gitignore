@@ -1,0 +1,6 @@
+.env
+purpleops.db
+navigator_layer.json
+__pycache__/
+*.pyc
+.DS_Store
